@@ -920,7 +920,7 @@ static void ena_free_tx_bufs(struct ena_ring *tx_ring)
 	unsigned long longest_jiffies_since_submitted = 0;
 	u32 i, uncompleted_pkts = 0;
 #ifdef ENA_AF_XDP_SUPPORT
-	int xsk_frames = 0;
+	u32 xsk_frames = 0;
 	bool is_xsk_ring;
 
 	is_xsk_ring = ENA_IS_XSK_RING(tx_ring);
@@ -957,7 +957,8 @@ static void ena_free_tx_bufs(struct ena_ring *tx_ring)
 #endif /* ENA_XDP_SUPPORT*/
 #ifdef ENA_AF_XDP_SUPPORT
 		} else if (is_xsk_ring) {
-			xsk_frames++;
+			xsk_frames += tx_info->xsk_descs ? tx_info->xsk_descs : 1;
+			tx_info->xsk_descs = 0;
 #endif /* ENA_AF_XDP_SUPPORT */
 		}
 	}
@@ -5719,6 +5720,14 @@ static int ena_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 #ifdef ENA_HAVE_NETDEV_XDP_FEATURES
 	netdev->xdp_features = ENA_XDP_FEATURES;
 
+	/* xsk_bind() rejects XDP_ZEROCOPY | XDP_USE_SG with -EOPNOTSUPP
+	 * unless the netdev advertises xdp_zc_max_segs > 1. ENA's XSK RX
+	 * path now chains up to MAX_SKB_FRAGS fragments per packet via
+	 * xsk_buff_add_frag(), so report that limit here.
+	 */
+#ifdef ENA_HAVE_XDP_ZC_MAX_SEGS
+	netdev->xdp_zc_max_segs = MAX_SKB_FRAGS;
+#endif
 #endif
 	memcpy(adapter->netdev->perm_addr, adapter->mac_addr, netdev->addr_len);
 

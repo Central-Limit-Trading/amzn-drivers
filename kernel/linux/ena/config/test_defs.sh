@@ -110,6 +110,15 @@ try_compile_async "#include <linux/netdevice.h>"         \
                   ""                                     \
                   "6.3.0 <= LINUX_VERSION_CODE"
 
+try_compile_async "#include <linux/netdevice.h>"         \
+                  "{
+                    struct net_device dev;
+                    dev.xdp_zc_max_segs = 0;
+                  }"                                     \
+                  "ENA_HAVE_XDP_ZC_MAX_SEGS"             \
+                  ""                                     \
+                  "6.5.0 <= LINUX_VERSION_CODE"
+
 try_compile_async "#include <linux/ptp_clock_kernel.h>"  \
                   "{
                     struct ptp_clock_info ptp_clk_info;

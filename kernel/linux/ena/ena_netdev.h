@@ -193,6 +193,11 @@ struct ena_tx_buffer {
 
 	/* used for ordering TX completions when needed (e.g. AF_XDP) */
 	u8 acked;
+	/* Number of AF_XDP TX descriptors consumed for this packet. A single
+	 * XDP_USE_SG packet can span multiple xdp_desc entries, while HW
+	 * completion is still reported per logical packet.
+	 */
+	u32 xsk_descs;
 #ifdef ENA_HAVE_XSK_TX_METADATA
 
 	/* Contains pointer to xsk completion metadata, filled at completion */

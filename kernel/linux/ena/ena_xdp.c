@@ -622,11 +622,12 @@ const struct xsk_tx_metadata_ops ena_xsk_tx_metadata_ops = {
  */
 static bool ena_xdp_clean_tx_zc(struct ena_ring *tx_ring, u32 budget)
 {
-	int rc, cleaned_pkts, zc_pkts, acked_pkts, missed_tx = 0;
+	int rc, cleaned_pkts, acked_pkts, missed_tx = 0;
 	struct xsk_buff_pool *xsk_pool = tx_ring->xsk_pool;
 	struct skb_shared_hwtstamps tx_hw_timestamp = {};
 	struct ena_tx_buffer *tx_info;
 	u32 total_done, tx_bytes = 0;
+	u32 zc_descs;
 #ifdef ENA_HAVE_XSK_TX_METADATA
 	bool is_tx_metadata_enabled;
 #endif /* ENA_HAVE_XSK_TX_METADATA */
@@ -699,7 +700,8 @@ static bool ena_xdp_clean_tx_zc(struct ena_ring *tx_ring, u32 budget)
 	 * this. Force ordering.
 	 */
 	total_done = 0;
-	cleaned_pkts = zc_pkts = 0;
+	cleaned_pkts = 0;
+	zc_descs = 0;
 	req_id = tx_ring->next_to_clean;
 	while (true) {
 		bool is_zc_pkt;
@@ -718,7 +720,10 @@ static bool ena_xdp_clean_tx_zc(struct ena_ring *tx_ring, u32 budget)
 		is_zc_pkt = !(skb || xdpf);
 
 		cleaned_pkts++;
-		zc_pkts += is_zc_pkt;
+		if (is_zc_pkt) {
+			zc_descs += tx_info->xsk_descs ? tx_info->xsk_descs : 1;
+			tx_info->xsk_descs = 0;
+		}
 		total_done += tx_info->tx_descs;
 
 		if (xdpf) {
@@ -750,8 +755,8 @@ static bool ena_xdp_clean_tx_zc(struct ena_ring *tx_ring, u32 budget)
 
 	ena_com_comp_ack(tx_ring->ena_com_io_sq, total_done);
 
-	if (zc_pkts)
-		xsk_tx_completed(xsk_pool, zc_pkts);
+	if (zc_descs)
+		xsk_tx_completed(xsk_pool, zc_descs);
 
 	return acked_pkts < budget;
 }
@@ -765,6 +770,8 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 	struct ena_tx_buffer *tx_info;
 	struct ena_com_buf *ena_buf;
 	u64 total_pkts, total_bytes;
+	u32 consumed_descs = 0;
+	u32 dropped_descs = 0;
 #ifdef ENA_HAVE_XSK_TX_METADATA
 	bool is_tx_metadata_enabled;
 #endif /* ENA_HAVE_XSK_TX_METADATA */
@@ -786,6 +793,10 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 
 	while (likely(work_done < budget)) {
 		struct ena_com_tx_ctx ena_tx_ctx = {};
+		u32 pkt_xsk_descs = 0;
+#ifdef ENA_HAVE_XSK_TX_METADATA
+		u64 first_addr;
+#endif /* ENA_HAVE_XSK_TX_METADATA */
 
 		/* To align with the network stack path (.ndo_start_xmit) we
 		 * leave the same amount of empty space in the SQ.
@@ -796,12 +807,26 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 
 		if (!xsk_tx_peek_desc(xsk_pool, &desc))
 			break;
+		pkt_xsk_descs = 1;
+#ifdef ENA_HAVE_XSK_TX_METADATA
+		first_addr = desc.addr;
+#endif /* ENA_HAVE_XSK_TX_METADATA */
 
 		next_to_use = tx_ring->next_to_use;
 		req_id = tx_ring->free_ids[next_to_use];
 		tx_info = &tx_ring->tx_buffer_info[req_id];
 
+		WARN_ON_ONCE(tx_info->total_tx_size);
+		tx_info->skb = NULL;
+#ifdef ENA_XDP_SUPPORT
+		tx_info->xdpf = NULL;
+#endif /* ENA_XDP_SUPPORT */
+		tx_info->num_of_bufs = 0;
+		tx_info->map_linear_data = 0;
+		tx_info->xsk_descs = 0;
+
 		size = desc.len;
+		push_len = 0;
 
 		if (likely(tx_ring->tx_mem_queue_type == ENA_ADMIN_PLACEMENT_POLICY_DEV)) {
 			/* Designate part of the packet for LLQ */
@@ -825,10 +850,65 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 			ena_tx_ctx.num_bufs = 1;
 		}
 
+#ifdef XDP_PKT_CONTD
+		/* Multi-buffer XDP_USE_SG TX: chain continuation descriptors
+		 * (XDP_PKT_CONTD set) into additional ena_bufs entries so the
+		 * device transmits the whole logical packet as one frame.
+		 * Without this, each desc would be sent as a standalone packet
+		 * with no L2/L3 continuity, and the receiver would drop them.
+		 */
+		while (desc.options & XDP_PKT_CONTD) {
+			struct xdp_desc cont_desc;
+
+			if (!xsk_tx_peek_desc(xsk_pool, &cont_desc)) {
+				/* Producer torn the packet mid-batch: drop the
+				 * partial. The kernel will return the unused
+				 * fill slots when we release.
+				 */
+				netdev_err_once(tx_ring->netdev,
+						"xsk_tx: missing continuation desc after XDP_PKT_CONTD\n");
+				ena_increase_stat(&tx_ring->tx_stats.bad_req_id,
+						  1, &tx_ring->syncp);
+				goto drop_packet;
+			}
+			pkt_xsk_descs++;
+			if (unlikely(ena_tx_ctx.num_bufs >= tx_ring->sgl_size)) {
+				netdev_err_once(tx_ring->netdev,
+						"xsk_tx: chained desc count exceeds sgl_size=%u\n",
+						tx_ring->sgl_size);
+				ena_increase_stat(&tx_ring->tx_stats.bad_req_id,
+						  1, &tx_ring->syncp);
+				/* Drain the rest of the chain so the producer
+				 * can move on; we'll drop the packet.
+				 */
+				while (cont_desc.options & XDP_PKT_CONTD) {
+					if (!xsk_tx_peek_desc(xsk_pool, &cont_desc))
+						break;
+					pkt_xsk_descs++;
+				}
+				goto drop_packet;
+			}
+			dma = xsk_buff_raw_get_dma(xsk_pool, cont_desc.addr);
+			ena_buf = &tx_info->bufs[ena_tx_ctx.num_bufs];
+			ena_buf->paddr = dma;
+			ena_buf->len = cont_desc.len;
+			if (ena_tx_ctx.num_bufs == 0) {
+				/* size==push_len handled the LLQ-only first
+				 * desc; promote the continuation as the first
+				 * DMA buf.
+				 */
+				ena_tx_ctx.ena_bufs = ena_buf;
+			}
+			ena_tx_ctx.num_bufs++;
+			size += cont_desc.len;
+			desc.options = cont_desc.options;
+		}
+#endif /* XDP_PKT_CONTD */
+
 #ifdef ENA_HAVE_XSK_TX_METADATA
 		if (unlikely(is_tx_metadata_enabled)) {
 			struct xsk_tx_metadata *meta =
-				xsk_buff_get_metadata(xsk_pool, desc.addr);
+				xsk_buff_get_metadata(xsk_pool, first_addr);
 
 			/* Save a pointer to completion metadata to fill it
 			 * later upon completion
@@ -844,19 +924,37 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 			  "Queueing zc packet on q %d, %s DMA part (req-id %d)\n",
 			  tx_ring->qid, ena_tx_ctx.num_bufs ? "with" : "without", req_id);
 
+		/* BQL/stats expect the full wire packet size: push_len (LLQ
+		 * header bytes inlined into the SQ) plus everything mapped
+		 * via ena_bufs[]. `size` has been reduced by push_len in the
+		 * LLQ block above, so add it back here. Single-desc tiny
+		 * LLQ packets where the whole payload fits in push_header
+		 * would otherwise be reported as 0 bytes and break BQL.
+		 */
 		rc = ena_xmit_common(tx_ring->adapter,
 				     tx_ring,
 				     tx_info,
 				     &ena_tx_ctx,
 				     next_to_use,
-				     desc.len);
-		if (rc)
+				     push_len + size);
+		if (rc) {
+			dropped_descs += pkt_xsk_descs;
+			consumed_descs += pkt_xsk_descs;
 			break;
+		}
 
+		tx_info->xsk_descs = pkt_xsk_descs;
 		total_pkts++;
-		total_bytes += desc.len;
+		total_bytes += push_len + size;
 
+		consumed_descs += pkt_xsk_descs;
 		work_done++;
+#ifdef XDP_PKT_CONTD
+		continue;
+drop_packet:
+		dropped_descs += pkt_xsk_descs;
+		consumed_descs += pkt_xsk_descs;
+#endif
 	}
 
 	if (work_done) {
@@ -864,10 +962,16 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 		tx_ring->tx_stats.xsk_cnt += total_pkts;
 		tx_ring->tx_stats.xsk_bytes += total_bytes;
 		u64_stats_update_end(&tx_ring->syncp);
-
-		xsk_tx_release(xsk_pool);
-		ena_ring_tx_doorbell(tx_ring);
 	}
+
+	if (consumed_descs) {
+		xsk_tx_release(xsk_pool);
+		if (dropped_descs)
+			xsk_tx_completed(xsk_pool, dropped_descs);
+	}
+
+	if (work_done)
+		ena_ring_tx_doorbell(tx_ring);
 
 	__netif_tx_unlock(txq);
 
@@ -876,18 +980,29 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 
 static struct sk_buff *ena_xdp_rx_skb_zc(struct ena_ring *rx_ring, struct xdp_buff *xdp)
 {
-	u32 headroom, data_len;
+	u32 headroom, data_len, total_len;
 	struct sk_buff *skb;
 	void *data_addr;
+#ifdef ENA_XDP_MB_SUPPORT
+	struct skb_shared_info *sh_info = NULL;
+	int i;
+#endif /* ENA_XDP_MB_SUPPORT */
 
-	/* Assuming single-page packets for XDP */
 	headroom  = xdp->data - xdp->data_hard_start;
 	data_len  = xdp->data_end - xdp->data;
-	data_addr = xdp->data;
+	total_len = data_len;
 
-	/* allocate a skb to store the frags */
+#ifdef ENA_XDP_MB_SUPPORT
+	if (xdp_buff_has_frags(xdp)) {
+		sh_info = xdp_get_shared_info_from_buff(xdp);
+		for (i = 0; i < sh_info->nr_frags; i++)
+			total_len += skb_frag_size(&sh_info->frags[i]);
+	}
+#endif /* ENA_XDP_MB_SUPPORT */
+
+	/* allocate a skb to store the data */
 	skb = napi_alloc_skb(rx_ring->napi,
-			     headroom + data_len);
+			     headroom + total_len);
 	if (unlikely(!skb)) {
 		ena_increase_stat(&rx_ring->rx_stats.skb_alloc_fail, 1,
 				  &rx_ring->syncp);
@@ -897,7 +1012,20 @@ static struct sk_buff *ena_xdp_rx_skb_zc(struct ena_ring *rx_ring, struct xdp_bu
 	}
 
 	skb_reserve(skb, headroom);
+	data_addr = xdp->data;
 	memcpy(__skb_put(skb, data_len), data_addr, data_len);
+
+#ifdef ENA_XDP_MB_SUPPORT
+	if (sh_info) {
+		for (i = 0; i < sh_info->nr_frags; i++) {
+			skb_frag_t *frag = &sh_info->frags[i];
+			void *frag_addr = page_address(skb_frag_page(frag)) + skb_frag_off(frag);
+			u32 frag_size = skb_frag_size(frag);
+
+			memcpy(__skb_put(skb, frag_size), frag_addr, frag_size);
+		}
+	}
+#endif /* ENA_XDP_MB_SUPPORT */
 
 	return skb;
 }
@@ -957,12 +1085,128 @@ static bool ena_xdp_clean_rx_irq_zc(struct ena_ring *rx_ring,
 		xdp->data_end = xdp->data + ena_rx_ctx.ena_bufs[0].len;
 		xsk_buff_dma_sync_for_cpu(xdp, rx_ring->xsk_pool);
 
-		/* XDP multi-buffer packets not supported */
+		/* XDP multi-buffer: chain remaining descriptors as fragments
+		 * when the loaded BPF program advertises xdp.frags support.
+		 * Otherwise drop, preserving the legacy single-frame contract.
+		 */
 		if (unlikely(ena_rx_ctx.descs > 1)) {
+#ifdef ENA_XDP_MB_SUPPORT
+			if (!xdp_prog || !rx_ring->xdp_prog_support_frags) {
+				int frag_i;
+				netdev_err_once(rx_ring->netdev,
+						"xdp: dropped multi-buffer packet (BPF prog lacks xdp.frags)\n");
+				for (frag_i = 1; frag_i < ena_rx_ctx.descs; frag_i++) {
+					struct ena_rx_buffer *frag_info =
+						&rx_ring->rx_buffer_info[ena_rx_ctx.ena_bufs[frag_i].req_id];
+					if (frag_info->xdp) {
+						xsk_buff_free(frag_info->xdp);
+						frag_info->xdp = NULL;
+					}
+				}
+				ena_increase_stat(&rx_ring->rx_stats.xdp_drop, 1, &rx_ring->syncp);
+				xdp_verdict = ENA_XDP_RECYCLE;
+			} else {
+				int frag_i;
+				bool chain_ok = true;
+
+				/* Note: do NOT pre-set the has_frags flag here.
+				 * __xdp_buff_add_frag() takes two code paths:
+				 *   if (!xdp_buff_has_frags(xdp))  -> init nr_frags=0
+				 *                                     + xdp_frags_{size,
+				 *                                     truesize}=0; goto fill
+				 *   else                            -> prev = &sinfo->
+				 *                                     frags[nr_frags - 1]
+				 * The second branch unconditionally indexes frags[-1u]
+				 * when nr_frags==0, even though `prev` is only consumed
+				 * under try_coalesce=true (false here), triggering
+				 * UBSAN array-index-out-of-bounds at include/net/xdp.h:214
+				 * on every fresh head. Letting the first xsk_buff_add_frag
+				 * take the !has_frags branch initialises nr_frags=0,
+				 * fills frags[0], and bumps nr_frags=1; we set the flag
+				 * after the first append so subsequent calls take the
+				 * normal path with a valid prev.
+				 */
+				for (frag_i = 1; frag_i < ena_rx_ctx.descs; frag_i++) {
+					struct ena_rx_buffer *frag_info =
+						&rx_ring->rx_buffer_info[ena_rx_ctx.ena_bufs[frag_i].req_id];
+					struct xdp_buff *frag_xdp = frag_info->xdp;
+
+					if (!frag_xdp) {
+						chain_ok = false;
+						break;
+					}
+					/* ENA applies pkt_offset to every RX buffer in
+					 * a multi-buffer packet, not just the head.
+					 * Match the actual DMA write start so the
+					 * continuation fragment does not expose the
+					 * alignment padding as packet data.
+					 */
+					frag_xdp->data = frag_xdp->data_hard_start +
+							 XDP_PACKET_HEADROOM +
+							 ena_rx_ctx.pkt_offset;
+					frag_xdp->data_end = frag_xdp->data +
+							     ena_rx_ctx.ena_bufs[frag_i].len;
+					xsk_buff_dma_sync_for_cpu(frag_xdp, rx_ring->xsk_pool);
+
+					if (!xsk_buff_add_frag(xdp, frag_xdp)) {
+						xsk_buff_free(frag_xdp);
+						frag_info->xdp = NULL;
+						chain_ok = false;
+						break;
+					}
+					if (frag_i == 1) {
+						/* First frag is in; flip the flag so
+						 * the next iteration's add_frag takes
+						 * the non-init kernel path safely.
+						 */
+						xdp_buff_set_frags_flag(xdp);
+					}
+					/* xsk_buff_add_frag transferred ownership; clear here so
+					 * the descriptor-recycle loop below doesn't double-free.
+					 */
+					frag_info->xdp = NULL;
+				}
+
+				if (!chain_ok) {
+					/* Clean up any remaining unprocessed fragments to
+					 * avoid leaks. Head xdp_buff (with partial chained
+					 * frags) is freed by the outer ENA_XDP_RECYCLE
+					 * branch below — freeing it here would double-free
+					 * into xsk_buff_pool->free_heads.
+					 */
+					for (; frag_i < ena_rx_ctx.descs; frag_i++) {
+						struct ena_rx_buffer *frag_info =
+							&rx_ring->rx_buffer_info[ena_rx_ctx.ena_bufs[frag_i].req_id];
+						if (frag_info->xdp) {
+							xsk_buff_free(frag_info->xdp);
+							frag_info->xdp = NULL;
+						}
+					}
+					ena_increase_stat(&rx_ring->rx_stats.xdp_drop, 1,
+							  &rx_ring->syncp);
+					xdp_verdict = ENA_XDP_RECYCLE;
+				} else {
+#ifdef ENA_HAVE_XDP_HINTS_DEPS
+					ena_xdp_buff_fill(xdp, &ena_rx_ctx);
+#endif /* ENA_HAVE_XDP_HINTS_DEPS */
+					xdp_verdict = ena_xdp_execute(rx_ring, xdp, xdp_prog);
+				}
+			}
+#else
+			int frag_i;
 			netdev_err_once(rx_ring->netdev,
 					"xdp: dropped unsupported multi-buffer packets\n");
+			for (frag_i = 1; frag_i < ena_rx_ctx.descs; frag_i++) {
+				struct ena_rx_buffer *frag_info =
+					&rx_ring->rx_buffer_info[ena_rx_ctx.ena_bufs[frag_i].req_id];
+				if (frag_info->xdp) {
+					xsk_buff_free(frag_info->xdp);
+					frag_info->xdp = NULL;
+				}
+			}
 			ena_increase_stat(&rx_ring->rx_stats.xdp_drop, 1, &rx_ring->syncp);
 			xdp_verdict = ENA_XDP_RECYCLE;
+#endif /* ENA_XDP_MB_SUPPORT */
 		} else if (likely(!!xdp_prog)) {
 #ifdef ENA_HAVE_XDP_HINTS_DEPS
 			ena_xdp_buff_fill(xdp, &ena_rx_ctx);
@@ -989,8 +1233,12 @@ static bool ena_xdp_clean_rx_irq_zc(struct ena_ring *rx_ring,
 			xdp_flags |= xdp_verdict;
 
 			/* Mark buffer as consumed when it is redirected or freed */
-			if (likely(xdp_verdict & (ENA_XDP_FORWARDED | ENA_XDP_DROP)))
+			if (likely(xdp_verdict & (ENA_XDP_FORWARDED | ENA_XDP_DROP))) {
 				rx_info->xdp = NULL;
+			} else if (xdp_verdict & ENA_XDP_RECYCLE) {
+				xsk_buff_free(xdp);
+				rx_info->xdp = NULL;
+			}
 
 			continue;
 		}
@@ -998,6 +1246,8 @@ static bool ena_xdp_clean_rx_irq_zc(struct ena_ring *rx_ring,
 		/* XDP PASS */
 		skb = ena_xdp_rx_skb_zc(rx_ring, xdp);
 		if (unlikely(!skb)) {
+			xsk_buff_free(xdp);
+			rx_info->xdp = NULL;
 			rc = -ENOMEM;
 			break;
 		}
@@ -1013,6 +1263,9 @@ static bool ena_xdp_clean_rx_irq_zc(struct ena_ring *rx_ring,
 			skb_hwtstamps(skb)->hwtstamp = ns_to_ktime(ena_rx_ctx.timestamp);
 
 		napi_gro_receive(napi, skb);
+
+		xsk_buff_free(xdp);
+		rx_info->xdp = NULL;
 
 	} while (likely(work_done <= budget));
 
